@@ -33,7 +33,6 @@ impl BatchDb for PostgresBatchDb {
             WHERE
                 number > $1
                 AND eth_commit_tx_id IS NOT NULL
-                AND eth_execute_tx_id IS NULL
             ORDER BY number ASC
             LIMIT 1
             "#,

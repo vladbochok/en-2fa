@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
-    let mut last_seen_batch: i64 = 0;
+    let mut last_seen_batch: i64 = 505965;
 
     loop {
         match db.fetch_next_ready_execute_call(last_seen_batch).await? {
@@ -269,17 +269,12 @@ async fn build_execute_batches_data(
 
     let l1_batches = vec![batch];
 
-    let internal_pv = l1_batches[0].header.protocol_version.unwrap_or(0);
     let mut dependency_roots: Vec<Vec<InteropRoot>> = Vec::with_capacity(l1_batches.len());
-    if is_pre_interop_fast_blocks(internal_pv) {
-        dependency_roots.push(Vec::new());
-    } else {
-        for b in &l1_batches {
-            let roots = get_interop_roots_batch(&pool, b.header.number)
-                .await
-                .context("get_interop_roots_batch")?;
-            dependency_roots.push(roots);
-        }
+    for b in &l1_batches {
+        let roots = get_interop_roots_batch(&pool, b.header.number)
+            .await
+            .context("get_interop_roots_batch")?;
+        dependency_roots.push(roots);
     }
 
     let priority_ops_proofs =
@@ -684,13 +679,16 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
     let system_logs: Vec<Vec<u8>> = row.try_get("system_logs")?;
     let protocol_version: Option<i32> = row.try_get("protocol_version")?;
 
-    let mut priority_ops_hashes = Vec::with_capacity(priority_ops_onchain_data.len());
-    for data in priority_ops_onchain_data {
-        if data.len() != 64 {
-            return Err(anyhow!("priority_ops_onchain_data entry has bad length {}", data.len()));
-        }
-        priority_ops_hashes.push(H256::from_slice(&data[32..64]));
-    }
+    let priority_ops_hashes = priority_ops_onchain_data
+        .into_iter()
+        .filter_map(|data| {
+            if data.len() < 64 {
+                None
+            } else {
+                Some(H256::from_slice(&data[32..64]))
+            }
+        })
+        .collect::<Vec<_>>();
 
     let header = L1BatchHeader {
         number: number as u32,
