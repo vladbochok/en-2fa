@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
-    let mut last_seen_batch: i64 = 505565;
+    let mut last_seen_batch: i64 = 505881;
 
     loop {
         match db.fetch_next_ready_execute_call(last_seen_batch).await? {
@@ -665,7 +665,7 @@ async fn load_l1_batch_with_metadata(
             timestamp,
             l1_tx_count,
             priority_ops_onchain_data,
-            hash,
+            root_hash,
             rollup_last_leaf_index,
             l2_l1_merkle_root,
             commitment,
@@ -689,7 +689,7 @@ async fn load_l1_batch_with_metadata(
     let timestamp: i64 = row.try_get("timestamp")?;
     let l1_tx_count: i32 = row.try_get("l1_tx_count")?;
     let priority_ops_onchain_data: Vec<Vec<u8>> = row.try_get("priority_ops_onchain_data")?;
-    let hash: Option<Vec<u8>> = row.try_get("hash")?;
+    let hash: Option<Vec<u8>> = row.try_get("root_hash")?;
     let rollup_last_leaf_index: Option<i64> = row.try_get("rollup_last_leaf_index")?;
     let l2_l1_merkle_root: Option<Vec<u8>> = row.try_get("l2_l1_merkle_root")?;
     let commitment: Option<Vec<u8>> = row.try_get("commitment")?;
