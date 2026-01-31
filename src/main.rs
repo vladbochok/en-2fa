@@ -143,14 +143,21 @@ async fn main() -> Result<()> {
             Some(ready) => {
                 info!(batch=%ready.l1_batch_number, "Found batch ready for execute; building calldata");
 
-                let (from_batch, to_batch, batch_data) = build_execute_batches_data(
+                let (from_batch, to_batch, batch_data) = match build_execute_batches_data(
                     pool.clone(),
                     ready.l1_batch_number as u32,
                     args.priority_tree_start_index,
                     args.chain_protocol_version,
                 )
                 .await
-                .context("Failed to build executeBatchesSharedBridge data")?;
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        warn!(batch=%ready.l1_batch_number, error=%err, "Failed to build execute calldata; retrying");
+                        sleep(Duration::from_secs(args.poll_interval_secs)).await;
+                        continue;
+                    }
+                };
 
                 let _calldata = build_execute_shared_bridge_calldata(
                     chain_address,
@@ -263,9 +270,15 @@ async fn build_execute_batches_data(
     priority_tree_start_index: Option<usize>,
     chain_protocol_version: Option<u16>,
 ) -> Result<(U256, U256, Bytes)> {
-    let batch = load_l1_batch_with_metadata(&pool, batch_number)
+    let Some(batch) = load_l1_batch_with_metadata(&pool, batch_number)
         .await
-        .context("load_l1_batch_with_metadata")?;
+        .context("load_l1_batch_with_metadata")?
+    else {
+        return Err(anyhow!(
+            "Batch {} is not fully sealed yet (missing metadata)",
+            batch_number
+        ));
+    };
 
     let l1_batches = vec![batch];
 
@@ -641,7 +654,10 @@ fn extract_dependency_roots_rolling_hash(system_logs: &[Vec<u8>]) -> Option<H256
     None
 }
 
-async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result<L1BatchWithMetadata> {
+async fn load_l1_batch_with_metadata(
+    pool: &PgPool,
+    batch_number: u32,
+) -> Result<Option<L1BatchWithMetadata>> {
     let row = sqlx::query(
         r#"
         SELECT
@@ -657,6 +673,7 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
             protocol_version
         FROM l1_batches
         WHERE number = $1
+            AND is_sealed
         "#,
     )
     .bind(batch_number as i64)
@@ -665,7 +682,7 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
     .context("load l1_batches row")?;
 
     let Some(row) = row else {
-        return Err(anyhow!("L1 batch {} not found in DB", batch_number));
+        return Ok(None);
     };
 
     let number: i64 = row.try_get("number")?;
@@ -679,16 +696,13 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
     let system_logs: Vec<Vec<u8>> = row.try_get("system_logs")?;
     let protocol_version: Option<i32> = row.try_get("protocol_version")?;
 
-    let priority_ops_hashes = priority_ops_onchain_data
-        .into_iter()
-        .filter_map(|data| {
-            if data.len() < 64 {
-                None
-            } else {
-                Some(H256::from_slice(&data[32..64]))
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut priority_ops_hashes = Vec::with_capacity(priority_ops_onchain_data.len());
+    for data in priority_ops_onchain_data {
+        if data.len() != 64 {
+            return Err(anyhow!("priority_ops_onchain_data entry has bad length {}", data.len()));
+        }
+        priority_ops_hashes.push(H256::from_slice(&data[32..64]));
+    }
 
     let header = L1BatchHeader {
         number: number as u32,
@@ -699,14 +713,27 @@ async fn load_l1_batch_with_metadata(pool: &PgPool, batch_number: u32) -> Result
         protocol_version: protocol_version.map(|v| v as u16),
     };
 
-    let metadata = L1BatchMetadata {
-        root_hash: H256::from_slice(&hash.ok_or_else(|| anyhow!("missing batch hash"))?),
-        rollup_last_leaf_index: rollup_last_leaf_index.ok_or_else(|| anyhow!("missing rollup_last_leaf_index"))? as u64,
-        l2_l1_merkle_root: H256::from_slice(&l2_l1_merkle_root.ok_or_else(|| anyhow!("missing l2_l1_merkle_root"))?),
-        commitment: H256::from_slice(&commitment.ok_or_else(|| anyhow!("missing commitment"))?),
+    let Some(hash) = hash else {
+        return Ok(None);
+    };
+    let Some(rollup_last_leaf_index) = rollup_last_leaf_index else {
+        return Ok(None);
+    };
+    let Some(l2_l1_merkle_root) = l2_l1_merkle_root else {
+        return Ok(None);
+    };
+    let Some(commitment) = commitment else {
+        return Ok(None);
     };
 
-    Ok(L1BatchWithMetadata { header, metadata })
+    let metadata = L1BatchMetadata {
+        root_hash: H256::from_slice(&hash),
+        rollup_last_leaf_index: rollup_last_leaf_index as u64,
+        l2_l1_merkle_root: H256::from_slice(&l2_l1_merkle_root),
+        commitment: H256::from_slice(&commitment),
+    };
+
+    Ok(Some(L1BatchWithMetadata { header, metadata }))
 }
 
 async fn get_interop_roots_batch(pool: &PgPool, batch_number: u32) -> Result<Vec<InteropRoot>> {
