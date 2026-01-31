@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
         .context("Failed to connect to Postgres (DATABASE_URL)")?;
     let db = PostgresBatchDb::new(pool.clone());
 
-    let mut last_seen_batch: i64 = 505965;
+    let mut last_seen_batch: i64 = 505565;
 
     loop {
         match db.fetch_next_ready_execute_call(last_seen_batch).await? {
