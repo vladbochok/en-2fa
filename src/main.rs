@@ -682,7 +682,7 @@ async fn load_l1_batch_with_metadata(
     .context("load l1_batches row")?;
 
     let Some(row) = row else {
-        println!("row");
+        tracing::info!("row");
         return Ok(None);
     };
 
@@ -715,19 +715,19 @@ async fn load_l1_batch_with_metadata(
     };
 
     let Some(hash) = hash else {
-        println!("hash");
+        tracing::info!("hash");
         return Ok(None);
     };
     let Some(rollup_last_leaf_index) = rollup_last_leaf_index else {
-        println!("rollup_last_leaf_index");
+        tracing::info!("rollup_last_leaf_index");
         return Ok(None);
     };
     let Some(l2_l1_merkle_root) = l2_l1_merkle_root else {
-        println!("l2_l1_merkle_root");
+        tracing::info!("l2_l1_merkle_root");
         return Ok(None);
     };
     let Some(commitment) = commitment else {
-        println!("commitment");
+        tracing::info!("commitment");
         return Ok(None);
     };
 
