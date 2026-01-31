@@ -32,9 +32,7 @@ impl BatchDb for PostgresBatchDb {
             FROM l1_batches
             WHERE
                 number > $1
-                AND is_sealed
-                AND eth_prove_tx_id IS NOT NULL
-                AND eth_execute_tx_id IS NULL
+                AND eth_execute_tx_id IS NOT NULL
             ORDER BY number ASC
             LIMIT 1
             "#,
