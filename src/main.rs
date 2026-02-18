@@ -28,9 +28,10 @@ abigen!(
         function approveHash(bytes32 _hash)
         function individualApprovals(address signer, bytes32 hash) view returns (bool)
         function executionMultisigMember(address signer) view returns (bool)
-        function totalApprovals(bytes32 hash) view returns (uint256)
+        function getApprovals(bytes32 hash) view returns (uint256)
         function threshold() view returns (uint256)
-        function executeBatchesSharedBridge(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData) 
+        function executeBatchesSharedBridge(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData)
+        function calculateHash(address _chainAddress, uint256 _processBatchFrom, uint256 _processBatchTo, bytes calldata _batchData) view returns (bytes32)
     ]"#
 );
 
@@ -198,6 +199,7 @@ async fn main() -> Result<()> {
             pool.clone(),
             run_one_batch as i64,
             chain_address,
+            chain_id,
             &args,
             contract.clone(),
             signer_addr,
@@ -226,6 +228,7 @@ async fn main() -> Result<()> {
                     pool.clone(),
                     ready.l1_batch_number,
                     chain_address,
+                    chain_id,
                     &args,
                     contract.clone(),
                     signer_addr,
@@ -248,6 +251,7 @@ async fn run_single_batch(
     pool: PgPool,
     l1_batch_number: i64,
     chain_address: Address,
+    chain_id: u64,
     args: &Args,
     contract: ExecutionMultisigValidator<SignerMiddleware<Provider<Http>, LocalWallet>>,
     signer_addr: Address,
@@ -276,9 +280,9 @@ async fn run_single_batch(
         batch_data.clone(),
     );
 
-    // keccak256(abi.encode(chainAddress, from, to, batchData))
+    // EIP-712 typed data hash matching EraMultisigValidator._hashTypedDataV4
     let approved_hash =
-        solidity_abi_encode_and_keccak(chain_address, from_batch, to_batch, &batch_data);
+        compute_eip712_hash(contract.address(), chain_id, chain_address, from_batch, to_batch, &batch_data);
 
     // check already signed (on Ethereum mainnet)
     let already = contract
@@ -311,9 +315,26 @@ async fn run_single_batch(
 
             let onchain_calldata = transaction.input.0;
 
-            let onchain_hash = H256::from(ethers::utils::keccak256(&Bytes::from(
-                onchain_calldata[4..].to_vec(),
-            )));
+            // Decode the calldata parameters (skip 4-byte selector) and recompute EIP-712 hash
+            let decoded = ethers::abi::decode(
+                &[
+                    ethers::abi::ParamType::Address,
+                    ethers::abi::ParamType::Uint(256),
+                    ethers::abi::ParamType::Uint(256),
+                    ethers::abi::ParamType::Bytes,
+                ],
+                &onchain_calldata[4..],
+            )
+            .context("Failed to decode on-chain calldata")?;
+
+            let onchain_hash = compute_eip712_hash(
+                contract.address(),
+                chain_id,
+                decoded[0].clone().into_address().unwrap(),
+                decoded[1].clone().into_uint().unwrap(),
+                decoded[2].clone().into_uint().unwrap(),
+                &Bytes::from(decoded[3].clone().into_bytes().unwrap()),
+            );
 
             if onchain_hash == approved_hash {
                 info!(" ALL GOOD - hashes match")
@@ -393,16 +414,63 @@ fn build_execute_shared_bridge_calldata(
     [selector.to_vec(), encoded_args].concat()
 }
 
-/// Mimic Solidity: keccak256(abi.encode(address,uint256,uint256,bytes))
-fn solidity_abi_encode_and_keccak(chain: Address, from: U256, to: U256, data: &Bytes) -> H256 {
-    let encoded = ethers::abi::encode(&[
+/// Compute EIP-712 typed data hash matching EraMultisigValidator._hashTypedDataV4.
+///
+/// Final hash = keccak256("\x19\x01" || domainSeparator || structHash)
+///
+/// Domain separator uses:
+///   EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)
+///   name = "EraMultisigValidator", version = "1", chainId = 1
+///
+/// Struct hash uses:
+///   ExecuteBatches(address chainAddress,uint256 processBatchFrom,uint256 processBatchTo,bytes batchData)
+fn compute_eip712_hash(
+    verifying_contract: Address,
+    chain_id: u64,
+    chain: Address,
+    from: U256,
+    to: U256,
+    data: &Bytes,
+) -> H256 {
+    // EIP712Domain typehash
+    let eip712domain_typehash = ethers::utils::keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+
+    // Domain separator
+    let name_hash = ethers::utils::keccak256(b"EraMultisigValidator");
+    let version_hash = ethers::utils::keccak256(b"1");
+    let domain_separator = ethers::utils::keccak256(ethers::abi::encode(&[
+        Token::FixedBytes(eip712domain_typehash.to_vec()),
+        Token::FixedBytes(name_hash.to_vec()),
+        Token::FixedBytes(version_hash.to_vec()),
+        Token::Uint(U256::from(chain_id)),
+        Token::Address(verifying_contract),
+    ]));
+
+    // ExecuteBatches typehash
+    let execute_batches_typehash = ethers::utils::keccak256(
+        b"ExecuteBatches(address chainAddress,uint256 processBatchFrom,uint256 processBatchTo,bytes batchData)",
+    );
+
+    // Struct hash: keccak256(abi.encode(typehash, chain, from, to, keccak256(data)))
+    let data_hash = ethers::utils::keccak256(data.as_ref());
+    let struct_hash = ethers::utils::keccak256(ethers::abi::encode(&[
+        Token::FixedBytes(execute_batches_typehash.to_vec()),
         Token::Address(chain),
         Token::Uint(from),
         Token::Uint(to),
-        Token::Bytes(data.to_vec()),
-    ]);
+        Token::FixedBytes(data_hash.to_vec()),
+    ]));
 
-    H256::from(ethers::utils::keccak256(encoded))
+    // Final EIP-712 hash: keccak256("\x19\x01" || domainSeparator || structHash)
+    let mut digest_input = Vec::with_capacity(2 + 32 + 32);
+    digest_input.push(0x19);
+    digest_input.push(0x01);
+    digest_input.extend_from_slice(&domain_separator);
+    digest_input.extend_from_slice(&struct_hash);
+
+    H256::from(ethers::utils::keccak256(digest_input))
 }
 
 async fn build_execute_batches_data(
@@ -982,4 +1050,114 @@ async fn get_batch_first_priority_op_id(pool: &PgPool, batch_number: u32) -> Res
 
     let id: Option<i64> = row.try_get("id")?;
     Ok(id.map(|v| v as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_eip712_hash() {
+        let verifying_contract =
+            Address::from_str("0xE222D6354b49eaF8a7099fC4E7F9C0B4FE72d1E7").unwrap();
+        let chain_id: u64 = 1;
+        let chain_address =
+            Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let from = U256::from(100);
+        let to = U256::from(100);
+        let data = Bytes::from(vec![0x12, 0x34]);
+
+        // Step 1: domain separator
+        let eip712domain_typehash = ethers::utils::keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+        );
+        let name_hash = ethers::utils::keccak256(b"EraMultisigValidator");
+        let version_hash = ethers::utils::keccak256(b"1");
+        let domain_separator = ethers::utils::keccak256(ethers::abi::encode(&[
+            Token::FixedBytes(eip712domain_typehash.to_vec()),
+            Token::FixedBytes(name_hash.to_vec()),
+            Token::FixedBytes(version_hash.to_vec()),
+            Token::Uint(U256::from(chain_id)),
+            Token::Address(verifying_contract),
+        ]));
+
+        // Step 2: struct hash
+        let execute_batches_typehash = ethers::utils::keccak256(
+            b"ExecuteBatches(address chainAddress,uint256 processBatchFrom,uint256 processBatchTo,bytes batchData)",
+        );
+        let data_hash = ethers::utils::keccak256(data.as_ref());
+        let struct_hash = ethers::utils::keccak256(ethers::abi::encode(&[
+            Token::FixedBytes(execute_batches_typehash.to_vec()),
+            Token::Address(chain_address),
+            Token::Uint(from),
+            Token::Uint(to),
+            Token::FixedBytes(data_hash.to_vec()),
+        ]));
+
+        // Step 3: final EIP-712 hash
+        let mut digest_input = Vec::with_capacity(2 + 32 + 32);
+        digest_input.push(0x19);
+        digest_input.push(0x01);
+        digest_input.extend_from_slice(&domain_separator);
+        digest_input.extend_from_slice(&struct_hash);
+        let expected = H256::from(ethers::utils::keccak256(digest_input));
+
+        let result = compute_eip712_hash(
+            verifying_contract,
+            chain_id,
+            chain_address,
+            from,
+            to,
+            &data,
+        );
+
+        assert_eq!(result, expected, "EIP-712 hash mismatch");
+
+        // Hardcoded expected value (computed once, acts as a regression guard).
+        // If the hashing logic changes, this will catch it.
+        let hardcoded_expected = H256::from_str(
+            "0x0fea9bd2e2dbeaae1846502ab98bed13f98d677e0616216cff17973dc00d134c",
+        )
+        .unwrap();
+        assert_eq!(
+            result, hardcoded_expected,
+            "EIP-712 hash does not match hardcoded expected value"
+        );
+    }
+
+    /// Verified against on-chain `calculateHash` on the Sepolia contract:
+    /// cast call 0x7De650653744Aa36eB6de0b384073fc3Cfe03275 \
+    ///   "calculateHash(address,uint256,uint256,bytes)(bytes32)" \
+    ///   0x0000000000000000000000000000000000000001 100 100 0x1234 \
+    ///   --rpc-url https://ethereum-sepolia-rpc.publicnode.com
+    #[test]
+    fn test_eip712_hash_matches_sepolia_contract() {
+        let verifying_contract =
+            Address::from_str("0x7De650653744Aa36eB6de0b384073fc3Cfe03275").unwrap();
+        let chain_id: u64 = 11155111; // Sepolia
+        let chain_address =
+            Address::from_str("0x0000000000000000000000000000000000000001").unwrap();
+        let from = U256::from(100);
+        let to = U256::from(100);
+        let data = Bytes::from(vec![0x12, 0x34]);
+
+        let result = compute_eip712_hash(
+            verifying_contract,
+            chain_id,
+            chain_address,
+            from,
+            to,
+            &data,
+        );
+
+        let expected_from_contract = H256::from_str(
+            "0x232fd9f202c1b984028512b978de9d04b148742a4524056064ee268b00cb3b02",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result, expected_from_contract,
+            "EIP-712 hash must match Sepolia contract calculateHash output"
+        );
+    }
 }
