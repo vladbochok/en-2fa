@@ -17,7 +17,9 @@ use db::{BatchDb, PostgresBatchDb};
 use sqlx::{PgPool, Row};
 mod merkle;
 
-use crate::merkle::{MiniMerkleTree, initialize_merkle_tree, prepare_merkle_up_to_priority_op};
+use crate::merkle::{
+    L1FetchConfig, MiniMerkleTree, initialize_merkle_tree, prepare_merkle_up_to_priority_op,
+};
 mod utils;
 
 abigen!(
@@ -119,6 +121,16 @@ struct Args {
     /// If set, run only one batch with this L1 batch number and exit.
     #[arg(long)]
     run_one_batch: Option<u64>,
+
+    /// First L1 block to scan for `NewPriorityRequest` events when backfilling priority-op leaves
+    /// that are missing from a snapshot-recovered DB. Set near the chain's L1 deployment block to
+    /// keep the one-time backfill scan fast (default 0 = scan from genesis).
+    #[arg(long, env = "L1_PRIORITY_SCAN_FROM_BLOCK", default_value_t = 0)]
+    l1_priority_scan_from_block: u64,
+
+    /// Number of L1 blocks per `eth_getLogs` request during the priority-op backfill scan.
+    #[arg(long, env = "L1_LOG_SCAN_CHUNK", default_value_t = 10_000)]
+    l1_log_scan_chunk: u64,
 }
 
 #[tokio::main]
@@ -199,6 +211,15 @@ async fn main() -> Result<()> {
         .as_u64() as usize;
     info!(%priority_tree_start_index, "Fetched priority tree start index from chain contract");
 
+    // Config for backfilling priority-op leaves from L1 when the EN DB lacks them
+    // (e.g. a snapshot-recovered node).
+    let l1_fetch_cfg = L1FetchConfig {
+        eth_rpc_url: args.eth_rpc_url.clone(),
+        chain_address,
+        scan_from_block: args.l1_priority_scan_from_block,
+        scan_chunk: args.l1_log_scan_chunk,
+    };
+
     // --- DB (External Node Postgres) ---
     let pool = PgPool::connect(&args.database_url)
         .await
@@ -222,7 +243,7 @@ async fn main() -> Result<()> {
 
         info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
         let mut initial_mini_merkle_tree =
-            initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, Some(run_one_batch - 1), priority_tree_start_index)
+            initialize_merkle_tree(pool.clone(), &l1_fetch_cfg, Some(run_one_batch - 1), priority_tree_start_index)
                 .await?;
 
         run_single_batch(
@@ -243,7 +264,7 @@ async fn main() -> Result<()> {
     // Automatic looping mode.
     let mut last_seen_batch: i64 = 0;
     let mut initial_mini_merkle_tree =
-        initialize_merkle_tree(pool.clone(), &args.eth_rpc_url, None, priority_tree_start_index).await?;
+        initialize_merkle_tree(pool.clone(), &l1_fetch_cfg, None, priority_tree_start_index).await?;
 
     info!("Initialization complete; polling for new batches every {} seconds", args.poll_interval_secs);
 
