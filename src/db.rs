@@ -29,6 +29,11 @@ pub trait BatchDb: Send + Sync {
         start_id: usize,
         end_id: usize,
     ) -> Result<Vec<H256>>;
+
+    /// Smallest `priority_op_id` present in the DB, or `None` if there are no priority txs.
+    /// On a snapshot-recovered / pruned node this is the first priority op the node has data
+    /// for; everything below it predates the snapshot and must be sourced from L1.
+    async fn get_min_priority_op_id(&self) -> Result<Option<i64>>;
 }
 
 pub struct PostgresBatchDb {
@@ -225,12 +230,37 @@ impl BatchDb for PostgresBatchDb {
             hashes.push(H256::from_slice(hash.as_slice()));
         }
 
-        assert_eq!(
-            hashes.len(),
-            end_id - start_id,
-            "Some priority ops in the given range are missing in the DB"
-        );
+        if hashes.len() != end_id - start_id {
+            anyhow::bail!(
+                "Some priority ops in range [{}, {}) are missing in the DB: found {} of {}. \
+                 This node is likely snapshot-recovered without the required priority-op history; \
+                 the Merkle tree should have been seeded from L1 during initialization.",
+                start_id,
+                end_id,
+                hashes.len(),
+                end_id - start_id
+            );
+        }
 
         Ok(hashes)
+    }
+
+    async fn get_min_priority_op_id(&self) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            r#"
+            SELECT MIN(priority_op_id) AS id
+            FROM transactions
+            WHERE is_priority = TRUE
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("DB query failed while fetching min priority_op_id")?;
+
+        let id: Option<i64> = row
+            .try_get("id")
+            .context("Missing/invalid priority_op_id column")?;
+
+        Ok(id)
     }
 }
