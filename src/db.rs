@@ -18,6 +18,10 @@ pub trait BatchDb: Send + Sync {
 
     async fn get_execution_tx_hash_for_batch(&self, batch_number: i64) -> Result<Option<String>>;
 
+    /// Returns the last L1 batch number that the EN's consistency checker has verified
+    /// against the L1 commit data. Returns None if no batch has been checked yet.
+    async fn get_consistency_checker_last_verified_batch(&self) -> Result<Option<i64>>;
+
     /// Gets all the priority transactions in a given range (exclusive of end_id).
     /// All of them must exist in the db.
     async fn get_l1_transactions_hashes_in_range(
@@ -43,6 +47,24 @@ impl BatchDb for PostgresBatchDb {
         &self,
         min_batch_exclusive: i64,
     ) -> Result<Option<ReadyExecuteCall>> {
+        // Only approve batches that the EN consistency checker has already verified
+        // against L1 commit data. This prevents approving batches based on
+        // potentially fabricated data that hasn't been cross-checked with L1.
+        let consistency_limit = self
+            .get_consistency_checker_last_verified_batch()
+            .await?;
+
+        let max_allowed = match consistency_limit {
+            Some(last_verified) => last_verified,
+            None => {
+                tracing::warn!(
+                    "consistency_checker_info has no entries; refusing to approve any batch \
+                     until the consistency checker has run"
+                );
+                return Ok(None);
+            }
+        };
+
         let row = sqlx::query(
             r#"
             SELECT
@@ -50,6 +72,7 @@ impl BatchDb for PostgresBatchDb {
             FROM l1_batches
             WHERE
                 number > $1
+                AND number <= $2
                 AND eth_commit_tx_id IS NOT NULL
                 AND eth_execute_tx_id IS NULL
             ORDER BY number ASC
@@ -57,6 +80,7 @@ impl BatchDb for PostgresBatchDb {
             "#,
         )
         .bind(min_batch_exclusive)
+        .bind(max_allowed)
         .fetch_optional(&self.pool)
         .await
         .context("DB query failed while fetching next ready execute call")?;
@@ -119,11 +143,15 @@ impl BatchDb for PostgresBatchDb {
             return Ok(None);
         };
 
-        let eth_execute_tx_id: i32 = row
+        let eth_execute_tx_id: Option<i32> = row
             .try_get("eth_execute_tx_id")
-            .context("Missing/invalid eth_execute_tx_id column. w")?;
+            .context("Missing/invalid eth_execute_tx_id column")?;
 
-        // Now get tx_has from the eth_txs_history, based off eth_execute_tx_id.
+        let Some(eth_execute_tx_id) = eth_execute_tx_id else {
+            return Ok(None);
+        };
+
+        // Now get tx_hash from the eth_txs_history, based off eth_execute_tx_id.
         let row = sqlx::query(
             r#"
             SELECT
@@ -147,6 +175,29 @@ impl BatchDb for PostgresBatchDb {
             .context("Missing/invalid tx_hash column")?;
 
         Ok(Some(tx_hash))
+    }
+
+    async fn get_consistency_checker_last_verified_batch(&self) -> Result<Option<i64>> {
+        let row = sqlx::query(
+            r#"
+            SELECT last_processed_l1_batch AS last_batch
+            FROM consistency_checker_info
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("DB query failed while fetching consistency_checker_info")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let last_batch: i64 = row
+            .try_get("last_batch")
+            .context("Missing/invalid last_processed_l1_batch column")?;
+
+        Ok(Some(last_batch))
     }
 
     async fn get_l1_transactions_hashes_in_range(

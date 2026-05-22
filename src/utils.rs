@@ -23,32 +23,62 @@ pub async fn get_priority_op_merkle_path(
 
     // Get the calldata from SAMPLE_TX, and parse it as ExecuteBatches
 
+    let tx_hash = H256::from_str(tx).context("Failed to parse tx hash")?;
     let transaction = eth_provider
-        .get_transaction(H256::from_str(tx).unwrap())
+        .get_transaction(tx_hash)
         .await
-        .unwrap()
-        .unwrap();
-    let header = transaction.input.0[..4].to_vec();
-    // Compare header to executeBatchesSharedBridge selector
-    let expected_header =
+        .context("Failed to fetch transaction from ETH RPC")?
+        .ok_or_else(|| anyhow::anyhow!("Transaction {} not found on ETH RPC", tx))?;
+    let selector = &transaction.input.0[..4];
+    let calldata = &transaction.input.0[4..];
+
+    // executeBatchesSharedBridge(address,uint256,uint256,bytes)
+    let selector_4param =
         &ethers::utils::keccak256(b"executeBatchesSharedBridge(address,uint256,uint256,bytes)")
-            [0..4];
-    assert_eq!(header.as_slice(), expected_header);
-    // TODO: check address
-    let decoded_execute_batches = ethers::abi::decode(
-        &[
-            ParamType::Address,
-            ParamType::Uint(256),
-            ParamType::Uint(256),
-            ParamType::Bytes,
-        ],
-        &transaction.input.0[4..],
-    )
-    .unwrap();
+            [..4];
+    // executeBatchesSharedBridge(uint256,address,uint256,uint256,bytes)
+    let selector_5param = &ethers::utils::keccak256(
+        b"executeBatchesSharedBridge(uint256,address,uint256,uint256,bytes)",
+    )[..4];
 
-    let first_batch = decoded_execute_batches[1].clone().into_uint().unwrap();
-
-    let payload = decoded_execute_batches[3].clone().into_bytes().unwrap();
+    let (first_batch, payload) = if selector == selector_4param {
+        let decoded = ethers::abi::decode(
+            &[
+                ParamType::Address,
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Bytes,
+            ],
+            calldata,
+        )
+        .context("Failed to decode 4-param executeBatchesSharedBridge calldata")?;
+        (
+            decoded[1].clone().into_uint().unwrap(),
+            decoded[3].clone().into_bytes().unwrap(),
+        )
+    } else if selector == selector_5param {
+        let decoded = ethers::abi::decode(
+            &[
+                ParamType::Uint(256),
+                ParamType::Address,
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Bytes,
+            ],
+            calldata,
+        )
+        .context("Failed to decode 5-param executeBatchesSharedBridge calldata")?;
+        (
+            decoded[2].clone().into_uint().unwrap(),
+            decoded[4].clone().into_bytes().unwrap(),
+        )
+    } else {
+        anyhow::bail!(
+            "Unknown function selector {:?} in tx {}, expected executeBatchesSharedBridge",
+            selector,
+            tx
+        );
+    };
     // First element is a version.
     assert_eq!(payload[0], 1u8);
 

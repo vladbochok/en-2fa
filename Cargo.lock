@@ -2046,10 +2046,12 @@ dependencies = [
  "dotenvy",
  "ethers",
  "hex",
+ "reqwest 0.11.27",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
