@@ -6,9 +6,10 @@ use ethers::prelude::*;
 use ethers::types::{Address, Bytes, H256, U256};
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::time::{Duration, sleep};
 use tracing::level_filters::LevelFilter;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod db;
@@ -20,6 +21,8 @@ mod merkle;
 use crate::merkle::{
     L1FetchConfig, MiniMerkleTree, initialize_merkle_tree, prepare_merkle_up_to_priority_op,
 };
+use crate::telemetry::{BatchRunOutcome, Telemetry};
+mod telemetry;
 mod utils;
 
 abigen!(
@@ -131,6 +134,10 @@ struct Args {
     /// Number of L1 blocks per `eth_getLogs` request during the priority-op backfill scan.
     #[arg(long, env = "L1_LOG_SCAN_CHUNK", default_value_t = 10_000)]
     l1_log_scan_chunk: u64,
+
+    /// If set, serve Prometheus metrics and Kubernetes health endpoints on this port.
+    #[arg(long, env = "METRICS_PORT")]
+    metrics_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -144,6 +151,25 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let telemetry = Arc::new(Telemetry::new());
+    if let Some(metrics_port) = args.metrics_port {
+        let http_addr = telemetry::bind_addr(metrics_port);
+        let http_listener = TcpListener::bind(http_addr)
+            .await
+            .with_context(|| format!("Failed to bind metrics server to {}", http_addr))?;
+        let http_addr = http_listener
+            .local_addr()
+            .context("Failed to read metrics listener address")?;
+        let http_telemetry = telemetry.clone();
+        tokio::spawn(async move {
+            if let Err(err) = telemetry::serve(http_listener, http_telemetry).await {
+                error!(%err, "Metrics server exited");
+            }
+        });
+        info!(%http_addr, "Metrics and health server listening");
+    } else {
+        info!("Metrics and health server disabled; set METRICS_PORT or --metrics-port to enable");
+    }
 
     // --- Ethereum mainnet provider + wallet (ALL contract calls go here) ---
     let http_client = reqwest::Client::builder()
@@ -237,16 +263,22 @@ async fn main() -> Result<()> {
             return Err(anyhow!(
                 "Batch {} has not been verified by the consistency checker yet (last verified: {}). \
                  Refusing to approve.",
-                run_one_batch, last_verified
+                run_one_batch,
+                last_verified
             ));
         }
 
         info!(batch=%run_one_batch, "Running single batch as requested; exiting after");
-        let mut initial_mini_merkle_tree =
-            initialize_merkle_tree(pool.clone(), &l1_fetch_cfg, Some(run_one_batch - 1), priority_tree_start_index)
-                .await?;
+        let mut initial_mini_merkle_tree = initialize_merkle_tree(
+            pool.clone(),
+            &l1_fetch_cfg,
+            Some(run_one_batch - 1),
+            priority_tree_start_index,
+        )
+        .await?;
 
-        run_single_batch(
+        telemetry.set_ready(true);
+        let outcome = match run_single_batch(
             pool.clone(),
             run_one_batch as i64,
             chain_address,
@@ -257,18 +289,32 @@ async fn main() -> Result<()> {
             &mut initial_mini_merkle_tree,
         )
         .await
-        .with_context(|| format!("run_single_batch for L1 batch {}", run_one_batch))?;
+        .with_context(|| format!("run_single_batch for L1 batch {}", run_one_batch))
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                telemetry.observe_batch_failure();
+                return Err(err);
+            }
+        };
+        telemetry.observe_batch_outcome(run_one_batch as i64, outcome);
         return Ok(());
     }
 
     // Automatic looping mode.
     let mut last_seen_batch: i64 = 0;
     let mut initial_mini_merkle_tree =
-        initialize_merkle_tree(pool.clone(), &l1_fetch_cfg, None, priority_tree_start_index).await?;
+        initialize_merkle_tree(pool.clone(), &l1_fetch_cfg, None, priority_tree_start_index)
+            .await?;
 
-    info!("Initialization complete; polling for new batches every {} seconds", args.poll_interval_secs);
+    telemetry.set_ready(true);
+    info!(
+        "Initialization complete; polling for new batches every {} seconds",
+        args.poll_interval_secs
+    );
 
     loop {
+        telemetry.mark_poll();
         match db.fetch_next_ready_execute_call(last_seen_batch).await? {
             None => {
                 sleep(Duration::from_secs(args.poll_interval_secs)).await;
@@ -277,7 +323,7 @@ async fn main() -> Result<()> {
             Some(ready) => {
                 info!(batch=%ready.l1_batch_number, "Found batch ready for execute; building calldata");
 
-                run_single_batch(
+                let outcome = match run_single_batch(
                     pool.clone(),
                     ready.l1_batch_number,
                     chain_address,
@@ -288,10 +334,16 @@ async fn main() -> Result<()> {
                     &mut initial_mini_merkle_tree,
                 )
                 .await
-                .with_context(|| {
-                    format!("run_single_batch for L1 batch {}", ready.l1_batch_number)
-                })?;
+                .with_context(|| format!("run_single_batch for L1 batch {}", ready.l1_batch_number))
+                {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        telemetry.observe_batch_failure();
+                        return Err(err);
+                    }
+                };
 
+                telemetry.observe_batch_outcome(ready.l1_batch_number, outcome);
                 last_seen_batch = ready.l1_batch_number;
             }
         }
@@ -309,7 +361,7 @@ async fn run_single_batch(
     contract: ExecutionMultisigValidator<SignerMiddleware<Provider<Http>, LocalWallet>>,
     signer_addr: Address,
     initial_mini_merkle_tree: &mut MiniMerkleTree,
-) -> Result<()> {
+) -> Result<BatchRunOutcome> {
     let (from_batch, to_batch, batch_data) = build_execute_batches_data(
         pool.clone(),
         l1_batch_number as u32,
@@ -334,8 +386,14 @@ async fn run_single_batch(
     );
 
     // EIP-712 typed data hash matching EraMultisigValidator._hashTypedDataV4
-    let approved_hash =
-        compute_eip712_hash(contract.address(), chain_id, chain_address, from_batch, to_batch, &batch_data);
+    let approved_hash = compute_eip712_hash(
+        contract.address(),
+        chain_id,
+        chain_address,
+        from_batch,
+        to_batch,
+        &batch_data,
+    );
 
     // check already signed (on Ethereum mainnet)
     let already = contract
@@ -359,19 +417,21 @@ async fn run_single_batch(
             let execute_tx_hash = H256::from_str(&execute_tx)
                 .context("Failed to parse execution tx hash from DB as H256")?;
 
-            let transaction = match contract
-                .client()
-                .get_transaction(execute_tx_hash)
-                .await
-            {
+            let transaction = match contract.client().get_transaction(execute_tx_hash).await {
                 Ok(Some(tx)) => tx,
                 Ok(None) => {
-                    warn!("Execution transaction {} not found on Ethereum mainnet; skipping on-chain hash verification", execute_tx_hash);
+                    warn!(
+                        "Execution transaction {} not found on Ethereum mainnet; skipping on-chain hash verification",
+                        execute_tx_hash
+                    );
                     // Skip verification — tx may have been sent via a different RPC or L1.
                     break 'verify;
                 }
                 Err(e) => {
-                    warn!("Failed to fetch execution transaction {} from Ethereum mainnet: {}; skipping on-chain hash verification", execute_tx_hash, e);
+                    warn!(
+                        "Failed to fetch execution transaction {} from Ethereum mainnet: {}; skipping on-chain hash verification",
+                        execute_tx_hash, e
+                    );
                     break 'verify;
                 }
             };
@@ -412,7 +472,7 @@ async fn run_single_batch(
 
     if already {
         info!(batch=%l1_batch_number, hash=%approved_hash, "Already approved; skipping");
-        return Ok(());
+        return Ok(BatchRunOutcome::AlreadyApproved);
     }
 
     info!(
@@ -427,7 +487,7 @@ async fn run_single_batch(
 
     if args.dry_run == 1 {
         warn!("DRY_RUN=1; not sending tx");
-        return Ok(());
+        return Ok(BatchRunOutcome::DryRun);
     }
 
     // avoid temporary-lifetime issue: bind call first
@@ -445,7 +505,7 @@ async fn run_single_batch(
         batch=%l1_batch_number,
         "approveHash mined"
     );
-    Ok(())
+    Ok(BatchRunOutcome::Submitted)
 }
 
 fn parse_address(s: &str) -> Result<Address> {
@@ -1165,23 +1225,16 @@ mod tests {
         digest_input.extend_from_slice(&struct_hash);
         let expected = H256::from(ethers::utils::keccak256(digest_input));
 
-        let result = compute_eip712_hash(
-            verifying_contract,
-            chain_id,
-            chain_address,
-            from,
-            to,
-            &data,
-        );
+        let result =
+            compute_eip712_hash(verifying_contract, chain_id, chain_address, from, to, &data);
 
         assert_eq!(result, expected, "EIP-712 hash mismatch");
 
         // Hardcoded expected value (computed once, acts as a regression guard).
         // If the hashing logic changes, this will catch it.
-        let hardcoded_expected = H256::from_str(
-            "0x0fea9bd2e2dbeaae1846502ab98bed13f98d677e0616216cff17973dc00d134c",
-        )
-        .unwrap();
+        let hardcoded_expected =
+            H256::from_str("0x0fea9bd2e2dbeaae1846502ab98bed13f98d677e0616216cff17973dc00d134c")
+                .unwrap();
         assert_eq!(
             result, hardcoded_expected,
             "EIP-712 hash does not match hardcoded expected value"
@@ -1204,19 +1257,12 @@ mod tests {
         let to = U256::from(100);
         let data = Bytes::from(vec![0x12, 0x34]);
 
-        let result = compute_eip712_hash(
-            verifying_contract,
-            chain_id,
-            chain_address,
-            from,
-            to,
-            &data,
-        );
+        let result =
+            compute_eip712_hash(verifying_contract, chain_id, chain_address, from, to, &data);
 
-        let expected_from_contract = H256::from_str(
-            "0x232fd9f202c1b984028512b978de9d04b148742a4524056064ee268b00cb3b02",
-        )
-        .unwrap();
+        let expected_from_contract =
+            H256::from_str("0x232fd9f202c1b984028512b978de9d04b148742a4524056064ee268b00cb3b02")
+                .unwrap();
 
         assert_eq!(
             result, expected_from_contract,
