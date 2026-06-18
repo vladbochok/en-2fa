@@ -13,3 +13,14 @@ Or you can run it in the main mode like this:
 ```
 cargo run
 ```
+
+The process can serve Kubernetes probes and Prometheus metrics when `METRICS_PORT` or
+`--metrics-port` is set:
+
+```shell
+cargo run -- --metrics-port 8080
+```
+
+- `GET /livez` and `GET /healthz/live` return 200 while the process is running.
+- `GET /readyz` and `GET /healthz/ready` return 200 after startup checks and Merkle initialization.
+- `GET /metrics` returns Prometheus text-format runtime metrics.
