@@ -118,6 +118,14 @@ struct Args {
     #[arg(long, env = "VALIDATOR_ADDRESS")]
     validator_address: String,
 
+    /// Settlement fee payer — the trailing `settlementFeePayer` argument of the v31+
+    /// `executeBatchesSharedBridge` calldata. It is a pure off-chain eth_sender config value with no
+    /// DB or RPC representation, so set it to match the operator's eth_sender `settlement_fee_payer`
+    /// config (which defaults to the operator's L1 sender account). Only consumed for protocol
+    /// version >= 31; defaults to the zero address when not provided.
+    #[arg(long, env = "SETTLEMENT_FEE_PAYER")]
+    settlement_fee_payer: Option<String>,
+
     /// If set, run only one batch with this L1 batch number and exit.
     #[arg(long)]
     run_one_batch: Option<u64>,
@@ -201,6 +209,14 @@ async fn main() -> Result<()> {
 
     let chain_address = parse_address(&args.chain_address)?;
 
+    // Parsed once here; only consumed by the v31+ encoding (see `encode_for_eth_tx`).
+    let settlement_fee_payer = args
+        .settlement_fee_payer
+        .as_deref()
+        .map(parse_address)
+        .transpose()
+        .context("Bad SETTLEMENT_FEE_PAYER")?;
+
     // Fetch PRIORITY_TREE_START_INDEX from the chain contract on-chain
     let chain_contract = ChainContract::new(chain_address, Arc::new(eth_provider.clone()));
     let priority_tree_start_index = chain_contract
@@ -255,6 +271,7 @@ async fn main() -> Result<()> {
             contract.clone(),
             signer_addr,
             &mut initial_mini_merkle_tree,
+            settlement_fee_payer,
         )
         .await
         .with_context(|| format!("run_single_batch for L1 batch {}", run_one_batch))?;
@@ -286,6 +303,7 @@ async fn main() -> Result<()> {
                     contract.clone(),
                     signer_addr,
                     &mut initial_mini_merkle_tree,
+                    settlement_fee_payer,
                 )
                 .await
                 .with_context(|| {
@@ -309,12 +327,14 @@ async fn run_single_batch(
     contract: ExecutionMultisigValidator<SignerMiddleware<Provider<Http>, LocalWallet>>,
     signer_addr: Address,
     initial_mini_merkle_tree: &mut MiniMerkleTree,
+    settlement_fee_payer: Option<Address>,
 ) -> Result<()> {
     let (from_batch, to_batch, batch_data) = build_execute_batches_data(
         pool.clone(),
         l1_batch_number as u32,
         initial_mini_merkle_tree,
         args.chain_protocol_version,
+        settlement_fee_payer,
     )
     .await
     .context("Failed to build executeBatchesSharedBridge data")?;
@@ -541,6 +561,7 @@ async fn build_execute_batches_data(
     batch_number: u32,
     initial_mini_merkle_tree: &mut MiniMerkleTree,
     chain_protocol_version: Option<u16>,
+    settlement_fee_payer: Option<Address>,
 ) -> Result<(U256, U256, Bytes)> {
     let batch = load_l1_batch_with_metadata(&pool, batch_number)
         .await
@@ -573,7 +594,7 @@ async fn build_execute_batches_data(
     let internal_pv = execute.l1_batches[0].header.protocol_version.unwrap_or(0);
     let chain_pv = chain_protocol_version.unwrap_or(internal_pv);
 
-    let tokens = execute.encode_for_eth_tx(chain_pv);
+    let tokens = execute.encode_for_eth_tx(chain_pv, settlement_fee_payer);
 
     let (from_batch, to_batch, batch_data) = match tokens.as_slice() {
         [Token::Uint(f), Token::Uint(t), Token::Bytes(b)] => (*f, *t, Bytes::from(b.clone())),
@@ -793,11 +814,23 @@ struct ExecuteBatches {
 }
 
 impl ExecuteBatches {
-    fn encode_for_eth_tx(&self, chain_protocol_version: u16) -> Vec<Token> {
+    // The encoding of `executeBatchesSharedBridge` calldata depends on the protocol version of both
+    // the underlying chain and the batches being executed. This mirrors
+    // `ExecuteBatches::encode_for_eth_tx` in zksync-era's `l1_contract_interface` crate.
+    //
+    // `settlement_fee_payer` is only consumed by the v31+ ("medium interop") encoding; pass `None`
+    // for older protocol versions. When `None` is passed to the v31+ branch it defaults to the zero
+    // address.
+    fn encode_for_eth_tx(
+        &self,
+        chain_protocol_version: u16,
+        settlement_fee_payer: Option<Address>,
+    ) -> Vec<Token> {
         let internal_protocol_version = self.l1_batches[0].header.protocol_version.unwrap_or(0);
 
-        if is_pre_gateway(internal_protocol_version) && is_pre_gateway(chain_protocol_version) {
-            vec![Token::Array(
+        // Token builders shared across the encoding variants below.
+        let stored_batch_infos = || {
+            Token::Array(
                 self.l1_batches
                     .iter()
                     .map(|batch| {
@@ -805,83 +838,91 @@ impl ExecuteBatches {
                             .into_token_with_protocol_version(internal_protocol_version)
                     })
                     .collect(),
-            )]
+            )
+        };
+        let priority_ops_proofs = || {
+            Token::Array(
+                self.priority_ops_proofs
+                    .iter()
+                    .map(|proof| proof.into_token())
+                    .collect(),
+            )
+        };
+        let dependency_roots = || {
+            Token::Array(
+                self.dependency_roots
+                    .iter()
+                    .map(|batch_roots| {
+                        Token::Array(
+                            batch_roots
+                                .iter()
+                                .cloned()
+                                .map(InteropRoot::into_token)
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+
+        // Prefix the ABI-encoded payload with the encoding-version byte and wrap it in the
+        // (processBatchFrom, processBatchTo, batchData) tuple expected by `executeBatchesSharedBridge`.
+        let wrap = |encoded_data: Vec<u8>| {
+            let execute_data = [
+                [get_encoding_version(internal_protocol_version)].to_vec(),
+                encoded_data,
+            ]
+            .concat();
+            vec![
+                Token::Uint(self.l1_batches[0].header.number.into()),
+                Token::Uint(self.l1_batches.last().unwrap().header.number.into()),
+                Token::Bytes(execute_data),
+            ]
+        };
+
+        let tokens = if is_pre_gateway(internal_protocol_version)
+            && is_pre_gateway(chain_protocol_version)
+        {
+            vec![stored_batch_infos()]
         } else if is_pre_interop_fast_blocks(internal_protocol_version)
             && is_pre_interop_fast_blocks(chain_protocol_version)
         {
-            let encoded_data = ethers::abi::encode(&[
-                Token::Array(
-                    self.l1_batches
-                        .iter()
-                        .map(|batch| {
-                            StoredBatchInfo::from(batch)
-                                .into_token_with_protocol_version(internal_protocol_version)
-                        })
-                        .collect(),
-                ),
-                Token::Array(
-                    self.priority_ops_proofs
-                        .iter()
-                        .map(|proof| proof.into_token())
-                        .collect(),
-                ),
-            ]);
-            let execute_data = [
-                [get_encoding_version(internal_protocol_version)].to_vec(),
-                encoded_data,
-            ]
-            .concat()
-            .to_vec();
-
-            vec![
-                Token::Uint(self.l1_batches[0].header.number.into()),
-                Token::Uint(self.l1_batches.last().unwrap().header.number.into()),
-                Token::Bytes(execute_data),
-            ]
+            wrap(ethers::abi::encode(&[
+                stored_batch_infos(),
+                priority_ops_proofs(),
+            ]))
+        } else if is_pre_medium_interop(internal_protocol_version)
+            && is_pre_medium_interop(chain_protocol_version)
+        {
+            // v29 / v30 interop: executeData, priorityOpsData, dependencyRoots.
+            wrap(ethers::abi::encode(&[
+                stored_batch_infos(),
+                priority_ops_proofs(),
+                dependency_roots(),
+            ]))
         } else {
-            let encoded_data = ethers::abi::encode(&[
-                Token::Array(
-                    self.l1_batches
-                        .iter()
-                        .map(|batch| {
-                            StoredBatchInfo::from(batch)
-                                .into_token_with_protocol_version(internal_protocol_version)
-                        })
-                        .collect(),
-                ),
-                Token::Array(
-                    self.priority_ops_proofs
-                        .iter()
-                        .map(|proof| proof.into_token())
-                        .collect(),
-                ),
-                Token::Array(
-                    self.dependency_roots
-                        .iter()
-                        .map(|batch_roots| {
-                            Token::Array(
-                                batch_roots
-                                    .iter()
-                                    .cloned()
-                                    .map(InteropRoot::into_token)
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                ),
-            ]);
-            let execute_data = [
-                [get_encoding_version(internal_protocol_version)].to_vec(),
-                encoded_data,
-            ]
-            .concat()
-            .to_vec();
-            vec![
-                Token::Uint(self.l1_batches[0].header.number.into()),
-                Token::Uint(self.l1_batches.last().unwrap().header.number.into()),
-                Token::Bytes(execute_data),
-            ]
-        }
+            // v31+ ("medium interop"): the calldata gained per-batch L2->L1 `logs`, `messages` and
+            // `messageRoots`, plus a trailing `settlementFeePayer` address.
+            //
+            // Those three per-batch arrays are only populated when the chain settles on the Gateway;
+            // on the EN's L1 (non-gateway) execute path — which is the only path this 2FA tool
+            // approves, since `executeBatchesSharedBridge` is called on the L1 ExecutionMultisigValidator
+            // — they are left empty and only `settlementFeePayer` carries data.
+            //
+            // Defaults to the zero address when not configured (see SETTLEMENT_FEE_PAYER).
+            let settlement_fee_payer = settlement_fee_payer.unwrap_or_default();
+            wrap(ethers::abi::encode(&[
+                stored_batch_infos(),
+                priority_ops_proofs(),
+                dependency_roots(),
+                Token::Array(vec![]), // logs (empty for L1 settlement)
+                Token::Array(vec![]), // messages (empty for L1 settlement)
+                Token::Array(vec![]), // messageRoots (empty for L1 settlement)
+                Token::Address(settlement_fee_payer),
+            ]))
+        };
+
+        tokens
     }
 }
 
@@ -921,6 +962,10 @@ fn is_pre_gateway(protocol_version: u16) -> bool {
 
 fn is_pre_interop_fast_blocks(protocol_version: u16) -> bool {
     protocol_version < 29
+}
+
+fn is_pre_medium_interop(protocol_version: u16) -> bool {
+    protocol_version < 31
 }
 
 const MESSAGE_ROOT_ROLLING_HASH_KEY: [u8; 32] = [
@@ -1118,6 +1163,73 @@ async fn get_batch_first_priority_op_id(pool: &PgPool, batch_number: u32) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::sol_types::SolValue;
+
+    /// Builds the ABI-encoded `priorityOpsData` token for a single proof with the given paths,
+    /// mirroring `PriorityOpsMerkleProof::into_token`.
+    fn priority_ops_token(left: &[H256], right: &[H256], hashes: &[H256]) -> Token {
+        let arr = |hs: &[H256]| {
+            Token::Array(
+                hs.iter()
+                    .map(|h| Token::FixedBytes(h.as_bytes().to_vec()))
+                    .collect(),
+            )
+        };
+        Token::Array(vec![Token::Tuple(vec![arr(left), arr(right), arr(hashes)])])
+    }
+
+    /// The bootstrap path (`utils::get_priority_op_merkle_path`) decodes the `batchData` payload of
+    /// a *previous* on-chain execute tx to recover the priority-op Merkle paths. After the v31
+    /// upgrade those payloads carry four extra trailing fields (logs, messages, messageRoots,
+    /// settlementFeePayer). This guards that the decoder still recovers `priorityOpsData` from the
+    /// new 7-field layout (and the old 3-field one).
+    #[test]
+    fn test_decode_priority_ops_from_v31_payload() {
+        let left = vec![H256::from_low_u64_be(0xaa)];
+        let right = vec![H256::from_low_u64_be(0xbb)];
+        let hashes = vec![H256::from_low_u64_be(0xcc)];
+
+        let check = |payload: &[u8]| {
+            // `utils` strips the leading encoding-version byte before decoding.
+            let decoded = ExecutePayload::abi_decode_sequence(&payload[1..])
+                .expect("payload must decode into ExecutePayload");
+            let proof = &decoded.priorityOpsData[0];
+            let got_left: Vec<H256> = proof
+                .leftPath
+                .iter()
+                .map(|h| H256::from_slice(h.as_slice()))
+                .collect();
+            let got_right: Vec<H256> = proof
+                .rightPath
+                .iter()
+                .map(|h| H256::from_slice(h.as_slice()))
+                .collect();
+            assert_eq!(got_left, left);
+            assert_eq!(got_right, right);
+        };
+
+        // v29 / v30 layout: executeData, priorityOpsData, dependencyRoots.
+        let mut old_payload = vec![1u8];
+        old_payload.extend(ethers::abi::encode(&[
+            Token::Array(vec![]),
+            priority_ops_token(&left, &right, &hashes),
+            Token::Array(vec![]),
+        ]));
+        check(&old_payload);
+
+        // v31 layout: + logs, messages, messageRoots, settlementFeePayer.
+        let mut v31_payload = vec![1u8];
+        v31_payload.extend(ethers::abi::encode(&[
+            Token::Array(vec![]),
+            priority_ops_token(&left, &right, &hashes),
+            Token::Array(vec![]),
+            Token::Array(vec![]),
+            Token::Array(vec![]),
+            Token::Array(vec![]),
+            Token::Address(Address::from_low_u64_be(0x1234)),
+        ]));
+        check(&v31_payload);
+    }
 
     #[test]
     fn test_compute_eip712_hash() {

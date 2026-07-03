@@ -82,6 +82,8 @@ pub async fn get_priority_op_merkle_path(
     // First element is a version.
     assert_eq!(payload[0], 1u8);
 
+    // The 3-field `ExecutePayload` decode still recovers `priorityOpsData` from a v31 (7-field)
+    // payload — ABI head offsets are absolute, so the extra trailing fields are simply ignored.
     let execute_payload = ExecutePayload::abi_decode_sequence(&payload[1..]).unwrap();
 
     let priority_ops = &execute_payload.priorityOpsData[0];
