@@ -452,6 +452,17 @@ async fn run_single_batch(
 
     // avoid temporary-lifetime issue: bind call first
     let call = contract.approve_hash(approved_hash.into());
+
+    // Estimate the gas and add a 50% buffer, so the tx does not run out of gas if the on-chain
+    // state changes between estimation and inclusion.
+    let estimated_gas = call
+        .estimate_gas()
+        .await
+        .context("Failed to estimate gas for approveHash tx")?;
+    let gas_limit = estimated_gas * 3 / 2;
+    debug!(%estimated_gas, %gas_limit, "Gas limit for approveHash tx (1.5x estimate)");
+    let call = call.gas(gas_limit);
+
     let pending = call.send().await.context("Failed to send approveHash tx")?;
 
     let receipt = pending
