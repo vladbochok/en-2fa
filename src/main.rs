@@ -78,6 +78,30 @@ sol! {
 
     }
 
+    /// v34 `StoredBatchInfo`: the v29+ layout plus a trailing `airbenderCommitment`.
+    #[derive(Debug)]
+    struct StoredBatchInfoV34Sol {
+        uint64 batchNumber;
+        bytes32 batchHash;
+        uint64 indexRepeatedStorageChanges;
+        uint256 numberOfLayer1Txs;
+        bytes32 priorityOperationsHash;
+        bytes32 dependencyRootsRollingHash;
+        bytes32 l2LogsTreeRoot;
+        uint256 timestamp;
+        bytes32 commitment;
+        bytes32 airbenderCommitment;
+    }
+
+    /// Leading fields of a v34 (encoding version 5) execute payload. The trailing v31+ fields
+    /// (logs, messages, messageRoots, settlementFeePayer) are not needed and are ignored.
+    #[derive(Debug)]
+    struct ExecutePayloadV34 {
+        StoredBatchInfoV34Sol[] memory executeData;
+        PriorityOpsBatchInfo[] memory priorityOpsData;
+        InteropRootSol[][] memory dependencyRoots;
+    }
+
 }
 
 #[derive(Parser, Debug)]
@@ -726,6 +750,8 @@ struct L1BatchMetadata {
     rollup_last_leaf_index: u64,
     l2_l1_merkle_root: H256,
     commitment: H256,
+    /// From `airbender_batch_commitments`; loaded only for protocol version >= 34.
+    airbender_commitment: Option<H256>,
 }
 
 #[derive(Debug, Clone)]
@@ -786,6 +812,8 @@ struct StoredBatchInfo {
     l2_logs_tree_root: H256,
     timestamp: U256,
     commitment: H256,
+    /// Only encoded for protocol version >= 34; zero for batches produced before v34.
+    airbender_commitment: H256,
 }
 
 impl StoredBatchInfo {
@@ -802,7 +830,7 @@ impl StoredBatchInfo {
                 Token::FixedBytes(self.commitment.as_bytes().to_vec()),
             ])
         } else {
-            Token::Tuple(vec![
+            let mut tokens = vec![
                 Token::Uint(self.batch_number.into()),
                 Token::FixedBytes(self.batch_hash.as_bytes().to_vec()),
                 Token::Uint(self.index_repeated_storage_changes.into()),
@@ -812,7 +840,13 @@ impl StoredBatchInfo {
                 Token::FixedBytes(self.l2_logs_tree_root.as_bytes().to_vec()),
                 Token::Uint(self.timestamp),
                 Token::FixedBytes(self.commitment.as_bytes().to_vec()),
-            ])
+            ];
+            if !is_pre_v34(protocol_version) {
+                tokens.push(Token::FixedBytes(
+                    self.airbender_commitment.as_bytes().to_vec(),
+                ));
+            }
+            Token::Tuple(tokens)
         }
     }
 }
@@ -839,14 +873,15 @@ impl ExecuteBatches {
     ) -> Vec<Token> {
         let internal_protocol_version = self.l1_batches[0].header.protocol_version.unwrap_or(0);
 
-        // Token builders shared across the encoding variants below.
-        let stored_batch_infos = || {
+        // Token builders shared across the encoding variants below. `StoredBatchInfo`'s layout
+        // depends on the protocol version it is encoded for.
+        let stored_batch_infos = |protocol_version: u16| {
             Token::Array(
                 self.l1_batches
                     .iter()
                     .map(|batch| {
                         StoredBatchInfo::from(batch)
-                            .into_token_with_protocol_version(internal_protocol_version)
+                            .into_token_with_protocol_version(protocol_version)
                     })
                     .collect(),
             )
@@ -878,12 +913,8 @@ impl ExecuteBatches {
 
         // Prefix the ABI-encoded payload with the encoding-version byte and wrap it in the
         // (processBatchFrom, processBatchTo, batchData) tuple expected by `executeBatchesSharedBridge`.
-        let wrap = |encoded_data: Vec<u8>| {
-            let execute_data = [
-                [get_encoding_version(internal_protocol_version)].to_vec(),
-                encoded_data,
-            ]
-            .concat();
+        let wrap = |encoding_version: u8, encoded_data: Vec<u8>| {
+            let execute_data = [vec![encoding_version], encoded_data].concat();
             vec![
                 Token::Uint(self.l1_batches[0].header.number.into()),
                 Token::Uint(self.l1_batches.last().unwrap().header.number.into()),
@@ -894,23 +925,29 @@ impl ExecuteBatches {
         let tokens = if is_pre_gateway(internal_protocol_version)
             && is_pre_gateway(chain_protocol_version)
         {
-            vec![stored_batch_infos()]
+            vec![stored_batch_infos(internal_protocol_version)]
         } else if is_pre_interop_fast_blocks(internal_protocol_version)
             && is_pre_interop_fast_blocks(chain_protocol_version)
         {
-            wrap(ethers::abi::encode(&[
-                stored_batch_infos(),
-                priority_ops_proofs(),
-            ]))
+            wrap(
+                get_encoding_version(internal_protocol_version),
+                ethers::abi::encode(&[
+                    stored_batch_infos(internal_protocol_version),
+                    priority_ops_proofs(),
+                ]),
+            )
         } else if is_pre_medium_interop(internal_protocol_version)
             && is_pre_medium_interop(chain_protocol_version)
         {
             // v29 / v30 interop: executeData, priorityOpsData, dependencyRoots.
-            wrap(ethers::abi::encode(&[
-                stored_batch_infos(),
-                priority_ops_proofs(),
-                dependency_roots(),
-            ]))
+            wrap(
+                get_encoding_version(internal_protocol_version),
+                ethers::abi::encode(&[
+                    stored_batch_infos(internal_protocol_version),
+                    priority_ops_proofs(),
+                    dependency_roots(),
+                ]),
+            )
         } else {
             // v31+ ("medium interop"): the calldata gained per-batch L2->L1 `logs`, `messages` and
             // `messageRoots`, plus a trailing `settlementFeePayer` address.
@@ -921,16 +958,24 @@ impl ExecuteBatches {
             // — they are left empty and only `settlementFeePayer` carries data.
             //
             // Defaults to the zero address when not configured (see SETTLEMENT_FEE_PAYER).
+            //
+            // As in zksync-era (since v34), this branch takes the encoding version and the
+            // `StoredBatchInfo` layout from the *chain* protocol version: a v34 chain expects
+            // version 5 and the trailing `airbenderCommitment` even for batches produced before
+            // the upgrade (their commitment is zero).
             let settlement_fee_payer = settlement_fee_payer.unwrap_or_default();
-            wrap(ethers::abi::encode(&[
-                stored_batch_infos(),
-                priority_ops_proofs(),
-                dependency_roots(),
-                Token::Array(vec![]), // logs (empty for L1 settlement)
-                Token::Array(vec![]), // messages (empty for L1 settlement)
-                Token::Array(vec![]), // messageRoots (empty for L1 settlement)
-                Token::Address(settlement_fee_payer),
-            ]))
+            wrap(
+                get_encoding_version(chain_protocol_version),
+                ethers::abi::encode(&[
+                    stored_batch_infos(chain_protocol_version),
+                    priority_ops_proofs(),
+                    dependency_roots(),
+                    Token::Array(vec![]), // logs (empty for L1 settlement)
+                    Token::Array(vec![]), // messages (empty for L1 settlement)
+                    Token::Array(vec![]), // messageRoots (empty for L1 settlement)
+                    Token::Address(settlement_fee_payer),
+                ]),
+            )
         };
 
         tokens
@@ -955,15 +1000,33 @@ impl From<&L1BatchWithMetadata> for StoredBatchInfo {
             l2_logs_tree_root: x.metadata.l2_l1_merkle_root,
             timestamp: x.header.timestamp.into(),
             commitment: x.metadata.commitment,
+            // `load_l1_batch_with_metadata` errors out if a v34+ batch has no Airbender commitment.
+            airbender_commitment: if is_pre_v34(pv) {
+                H256::zero()
+            } else {
+                x.metadata
+                    .airbender_commitment
+                    .expect("v34+ batch loaded without an Airbender commitment")
+            },
         }
     }
 }
 
+/// Execute payload encoding version before v29 (interop).
+const ENCODING_VERSION_PRE_INTEROP: u8 = 0;
+/// Execute payload encoding version for v29 - v33.
+const ENCODING_VERSION_INTEROP: u8 = 1;
+/// Execute payload encoding version from v34 on (`EncodingVersion::MultiProof` in zksync-era).
+const ENCODING_VERSION_V34: u8 = 5;
+
+/// Mirrors `get_encoding_version` in zksync-era's `l1_contract_interface` crate.
 fn get_encoding_version(protocol_version: u16) -> u8 {
-    if is_pre_interop_fast_blocks(protocol_version) {
-        0
+    if !is_pre_v34(protocol_version) {
+        ENCODING_VERSION_V34
+    } else if is_pre_interop_fast_blocks(protocol_version) {
+        ENCODING_VERSION_PRE_INTEROP
     } else {
-        1
+        ENCODING_VERSION_INTEROP
     }
 }
 
@@ -977,6 +1040,10 @@ fn is_pre_interop_fast_blocks(protocol_version: u16) -> bool {
 
 fn is_pre_medium_interop(protocol_version: u16) -> bool {
     protocol_version < 31
+}
+
+fn is_pre_v34(protocol_version: u16) -> bool {
+    protocol_version < 34
 }
 
 const MESSAGE_ROOT_ROLLING_HASH_KEY: [u8; 32] = [
@@ -1059,6 +1126,23 @@ async fn load_l1_batch_with_metadata(
         protocol_version: protocol_version.map(|v| v as u16),
     };
 
+    // Only v34+ batches carry an Airbender commitment. Querying the table only for them keeps
+    // older EN DBs (without `airbender_batch_commitments`) working.
+    let airbender_commitment = if is_pre_v34(header.protocol_version.unwrap_or(0)) {
+        None
+    } else {
+        Some(
+            get_airbender_batch_commitment(pool, batch_number)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing Airbender commitment for v34+ L1 batch {}",
+                        batch_number
+                    )
+                })?,
+        )
+    };
+
     let metadata = L1BatchMetadata {
         root_hash: H256::from_slice(&hash.ok_or_else(|| anyhow!("missing batch hash"))?),
         rollup_last_leaf_index: rollup_last_leaf_index
@@ -1068,9 +1152,37 @@ async fn load_l1_batch_with_metadata(
             &l2_l1_merkle_root.ok_or_else(|| anyhow!("missing l2_l1_merkle_root"))?,
         ),
         commitment: H256::from_slice(&commitment.ok_or_else(|| anyhow!("missing commitment"))?),
+        airbender_commitment,
     };
 
     Ok(L1BatchWithMetadata { header, metadata })
+}
+
+async fn get_airbender_batch_commitment(pool: &PgPool, batch_number: u32) -> Result<Option<H256>> {
+    let row = sqlx::query(
+        r#"
+        SELECT commitment
+        FROM airbender_batch_commitments
+        WHERE l1_batch_number = $1
+        "#,
+    )
+    .bind(batch_number as i64)
+    .fetch_optional(pool)
+    .await
+    .context("load airbender_batch_commitments row")?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let commitment: Vec<u8> = row.try_get("commitment")?;
+    if commitment.len() != 32 {
+        return Err(anyhow!(
+            "Airbender commitment for L1 batch {} has bad length {}",
+            batch_number,
+            commitment.len()
+        ));
+    }
+    Ok(Some(H256::from_slice(&commitment)))
 }
 
 async fn get_interop_roots_batch(pool: &PgPool, batch_number: u32) -> Result<Vec<InteropRoot>> {
@@ -1189,38 +1301,66 @@ mod tests {
         Token::Array(vec![Token::Tuple(vec![arr(left), arr(right), arr(hashes)])])
     }
 
+    /// A batch with one priority op, filled with distinct non-zero values.
+    fn test_batch(number: u32, protocol_version: u16) -> L1BatchWithMetadata {
+        L1BatchWithMetadata {
+            header: L1BatchHeader {
+                number,
+                timestamp: 1_700_000_000,
+                l1_tx_count: 1,
+                priority_ops_onchain_data: vec![H256::from_low_u64_be(0x11)],
+                system_logs: vec![],
+                protocol_version: Some(protocol_version),
+            },
+            metadata: L1BatchMetadata {
+                root_hash: H256::from_low_u64_be(0x22),
+                rollup_last_leaf_index: 77,
+                l2_l1_merkle_root: H256::from_low_u64_be(0x33),
+                commitment: H256::from_low_u64_be(0x44),
+                airbender_commitment: (!is_pre_v34(protocol_version))
+                    .then(|| H256::from_low_u64_be(0x55)),
+            },
+        }
+    }
+
+    fn test_execute(batch: L1BatchWithMetadata) -> ExecuteBatches {
+        ExecuteBatches {
+            l1_batches: vec![batch],
+            priority_ops_proofs: vec![PriorityOpsMerkleProof {
+                left_path: vec![H256::from_low_u64_be(0xaa)],
+                right_path: vec![H256::from_low_u64_be(0xbb)],
+                hashes: vec![H256::from_low_u64_be(0xcc)],
+            }],
+            dependency_roots: vec![vec![]],
+        }
+    }
+
+    /// Returns `batchData` from `encode_for_eth_tx`'s (from, to, batchData) tokens.
+    fn batch_data(tokens: Vec<Token>) -> Vec<u8> {
+        match tokens.as_slice() {
+            [Token::Uint(_), Token::Uint(_), Token::Bytes(b)] => b.clone(),
+            other => panic!("unexpected tokens: {other:?}"),
+        }
+    }
+
     /// The bootstrap path (`utils::get_priority_op_merkle_path`) decodes the `batchData` payload of
-    /// a *previous* on-chain execute tx to recover the priority-op Merkle paths. After the v31
-    /// upgrade those payloads carry four extra trailing fields (logs, messages, messageRoots,
-    /// settlementFeePayer). This guards that the decoder still recovers `priorityOpsData` from the
-    /// new 7-field layout (and the old 3-field one).
+    /// a *previous* on-chain execute tx to recover the priority-op Merkle paths. This guards that
+    /// the decoder recovers `priorityOpsData` from every layout seen on-chain: v29/v30 (3 fields),
+    /// v31-v33 (7 fields), and v34 (encoding version 5, `StoredBatchInfo` + `airbenderCommitment`).
     #[test]
-    fn test_decode_priority_ops_from_v31_payload() {
+    fn test_decode_priority_ops_from_payloads() {
         let left = vec![H256::from_low_u64_be(0xaa)];
         let right = vec![H256::from_low_u64_be(0xbb)];
         let hashes = vec![H256::from_low_u64_be(0xcc)];
 
         let check = |payload: &[u8]| {
-            // `utils` strips the leading encoding-version byte before decoding.
-            let decoded = ExecutePayload::abi_decode_sequence(&payload[1..])
-                .expect("payload must decode into ExecutePayload");
-            let proof = &decoded.priorityOpsData[0];
-            let got_left: Vec<H256> = proof
-                .leftPath
-                .iter()
-                .map(|h| H256::from_slice(h.as_slice()))
-                .collect();
-            let got_right: Vec<H256> = proof
-                .rightPath
-                .iter()
-                .map(|h| H256::from_slice(h.as_slice()))
-                .collect();
+            let (got_left, got_right) = utils::decode_first_priority_op_paths(payload);
             assert_eq!(got_left, left);
             assert_eq!(got_right, right);
         };
 
         // v29 / v30 layout: executeData, priorityOpsData, dependencyRoots.
-        let mut old_payload = vec![1u8];
+        let mut old_payload = vec![ENCODING_VERSION_INTEROP];
         old_payload.extend(ethers::abi::encode(&[
             Token::Array(vec![]),
             priority_ops_token(&left, &right, &hashes),
@@ -1229,7 +1369,7 @@ mod tests {
         check(&old_payload);
 
         // v31 layout: + logs, messages, messageRoots, settlementFeePayer.
-        let mut v31_payload = vec![1u8];
+        let mut v31_payload = vec![ENCODING_VERSION_INTEROP];
         v31_payload.extend(ethers::abi::encode(&[
             Token::Array(vec![]),
             priority_ops_token(&left, &right, &hashes),
@@ -1240,6 +1380,152 @@ mod tests {
             Token::Address(Address::from_low_u64_be(0x1234)),
         ]));
         check(&v31_payload);
+
+        // v31-v33 and v34 payloads as `encode_for_eth_tx` builds them, with a non-empty
+        // `executeData` so the `StoredBatchInfo` layout matters.
+        for pv in [31, 33, 34] {
+            let payload = batch_data(
+                test_execute(test_batch(10, pv)).encode_for_eth_tx(pv, Some(Address::zero())),
+            );
+            check(&payload);
+        }
+    }
+
+    /// Real v34 `batchData` from Sepolia execute tx
+    /// 0xa5028b14debb4c42c3381c90c332b803e4d05d6d00f5f7502ab0838b52f4b587 (era stage, batch 108790),
+    /// the kind of payload that made the v1-only bootstrap panic.
+    #[test]
+    fn test_decode_priority_ops_from_sepolia_v34_tx() {
+        let hex_data = include_str!("testdata/sepolia_v34_execute_batch_data.hex").trim();
+        let payload = hex::decode(hex_data.strip_prefix("0x").unwrap()).unwrap();
+        assert_eq!(payload[0], ENCODING_VERSION_V34);
+
+        let decoded = ExecutePayloadV34::abi_decode_sequence(&payload[1..]).unwrap();
+        let info = &decoded.executeData[0];
+        assert_eq!(info.batchNumber, 108790);
+        assert_eq!(
+            info.airbenderCommitment.to_string(),
+            "0xcc998dfb867ed45a6f0107cff16abdb6ab1f4aa7291270f3b8214cc887e7e633"
+        );
+
+        let (left, right) = utils::decode_first_priority_op_paths(&payload);
+        assert_eq!(left.len(), 14);
+        assert_eq!(right.len(), 14);
+        assert_eq!(
+            left[2],
+            H256::from_str("0x8aa1155133ce9b3642977dff3a627fbd0b8ca6d9880c91b3a43e29cf34a9e646")
+                .unwrap()
+        );
+        assert_eq!(
+            right[0],
+            H256::from_str("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Unsupported execute payload encoding version 2")]
+    fn test_decode_rejects_unknown_encoding_version() {
+        let mut payload = vec![2u8];
+        payload.extend(ethers::abi::encode(&[
+            Token::Array(vec![]),
+            priority_ops_token(&[], &[], &[]),
+            Token::Array(vec![]),
+        ]));
+        utils::decode_first_priority_op_paths(&payload);
+    }
+
+    #[test]
+    fn test_get_encoding_version() {
+        assert_eq!(get_encoding_version(28), 0);
+        assert_eq!(get_encoding_version(29), 1);
+        assert_eq!(get_encoding_version(33), 1);
+        assert_eq!(get_encoding_version(34), 5);
+        assert_eq!(get_encoding_version(35), 5);
+    }
+
+    /// v34 execute data: version byte 5, and each `StoredBatchInfo` carries the trailing
+    /// `airbenderCommitment` (decoded here with the `IExecutor.sol` v34 struct layout).
+    #[test]
+    fn test_encode_execute_v34() {
+        let fee_payer = Address::from_low_u64_be(0x1234);
+        let payload = batch_data(
+            test_execute(test_batch(10, 34)).encode_for_eth_tx(34, Some(fee_payer)),
+        );
+        assert_eq!(payload[0], ENCODING_VERSION_V34);
+
+        // Full 7-field decode: nothing is missing or left over.
+        alloy::sol! {
+            struct L2Log {
+                uint8 l2ShardId;
+                bool isService;
+                uint16 txNumberInBatch;
+                address sender;
+                bytes32 key;
+                bytes32 value;
+            }
+        }
+        type FullV34 = (
+            Vec<StoredBatchInfoV34Sol>,
+            Vec<PriorityOpsBatchInfo>,
+            Vec<Vec<InteropRootSol>>,
+            Vec<Vec<L2Log>>,
+            Vec<Vec<alloy::primitives::Bytes>>,
+            Vec<alloy::primitives::FixedBytes<32>>,
+            alloy::primitives::Address,
+        );
+        let (infos, proofs, roots, logs, messages, message_roots, payer) =
+            <FullV34 as SolValue>::abi_decode_params_validate(&payload[1..])
+                .expect("v34 payload must match the IExecutor.sol layout");
+
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert_eq!(info.batchNumber, 10);
+        assert_eq!(info.batchHash.as_slice(), H256::from_low_u64_be(0x22).as_bytes());
+        assert_eq!(info.indexRepeatedStorageChanges, 77);
+        assert_eq!(info.commitment.as_slice(), H256::from_low_u64_be(0x44).as_bytes());
+        assert_eq!(
+            info.airbenderCommitment.as_slice(),
+            H256::from_low_u64_be(0x55).as_bytes()
+        );
+        assert_eq!(proofs.len(), 1);
+        assert!(roots.len() == 1 && roots[0].is_empty());
+        assert!(logs.is_empty() && messages.is_empty() && message_roots.is_empty());
+        assert_eq!(payer.as_slice(), fee_payer.as_bytes());
+    }
+
+    /// A batch produced before v34 but executed on a v34 chain uses the v34 encoding with a zero
+    /// Airbender commitment, as zksync-era does.
+    #[test]
+    fn test_encode_execute_pre_v34_batch_on_v34_chain() {
+        let payload = batch_data(
+            test_execute(test_batch(10, 33)).encode_for_eth_tx(34, Some(Address::zero())),
+        );
+        assert_eq!(payload[0], ENCODING_VERSION_V34);
+        let decoded = ExecutePayloadV34::abi_decode_sequence(&payload[1..]).unwrap();
+        assert_eq!(decoded.executeData[0].batchNumber, 10);
+        assert!(decoded.executeData[0].airbenderCommitment.is_zero());
+    }
+
+    /// v31-v33 encoding is unchanged: version byte 1 and the 9-field `StoredBatchInfo`.
+    #[test]
+    fn test_encode_execute_v33_unchanged() {
+        let payload = batch_data(
+            test_execute(test_batch(10, 33)).encode_for_eth_tx(33, Some(Address::zero())),
+        );
+        assert_eq!(payload[0], ENCODING_VERSION_INTEROP);
+        let decoded = ExecutePayload::abi_decode_sequence(&payload[1..]).unwrap();
+        assert_eq!(decoded.executeData[0].batchNumber, 10);
+        assert_eq!(
+            decoded.executeData[0].commitment.as_slice(),
+            H256::from_low_u64_be(0x44).as_bytes()
+        );
+        // Offsets of the 7 head words, then `executeData` length (1) and one 9-word element,
+        // followed directly by the `priorityOpsData` length word.
+        let words = |i: usize| U256::from_big_endian(&payload[1 + 32 * i..1 + 32 * (i + 1)]);
+        assert_eq!(words(0), U256::from(7 * 32));
+        assert_eq!(words(7), U256::from(1));
+        assert_eq!(words(1), U256::from((7 + 1 + 9) * 32));
     }
 
     #[test]

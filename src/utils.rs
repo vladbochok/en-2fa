@@ -8,7 +8,7 @@ use ethers::{
     types::{H256, U256},
 };
 
-use crate::ExecutePayload;
+use crate::{ENCODING_VERSION_INTEROP, ENCODING_VERSION_V34, ExecutePayload, ExecutePayloadV34};
 
 /// Takes a given "trusted" transaction (that should be an existing "ExecuteBatches" on-chain tx),
 /// and extracts the Merkle path for the first priority operation in the first batch included in that
@@ -79,27 +79,44 @@ pub async fn get_priority_op_merkle_path(
             tx
         );
     };
-    // First element is a version.
-    assert_eq!(payload[0], 1u8);
 
-    // The 3-field `ExecutePayload` decode still recovers `priorityOpsData` from a v31 (7-field)
-    // payload — ABI head offsets are absolute, so the extra trailing fields are simply ignored.
-    let execute_payload = ExecutePayload::abi_decode_sequence(&payload[1..]).unwrap();
+    let (priority_ops_left, priority_ops_right) = decode_first_priority_op_paths(&payload);
 
-    let priority_ops = &execute_payload.priorityOpsData[0];
+    Ok((first_batch, priority_ops_left, priority_ops_right))
+}
 
-    let priority_ops_left = &priority_ops.leftPath;
-    let priority_ops_right = &priority_ops.rightPath;
-
-    Ok((
-        first_batch,
-        priority_ops_left
-            .iter()
+/// Decodes an execute `batchData` payload (encoding-version byte followed by the ABI-encoded
+/// data) and returns the left and right Merkle paths of its first priority-ops proof.
+///
+/// Panics on an encoding version it does not know: guessing the layout could seed the priority
+/// tree from the wrong bytes.
+pub(crate) fn decode_first_priority_op_paths(payload: &[u8]) -> (Vec<H256>, Vec<H256>) {
+    let to_h256 = |hs: &[alloy::primitives::FixedBytes<32>]| {
+        hs.iter()
             .map(|h| H256::from_slice(h.as_slice()))
-            .collect(),
-        priority_ops_right
-            .iter()
-            .map(|h| H256::from_slice(h.as_slice()))
-            .collect(),
-    ))
+            .collect::<Vec<_>>()
+    };
+
+    // The first byte is the encoding version. The payload's leading fields are decoded only; any
+    // trailing v31+ fields (logs, messages, messageRoots, settlementFeePayer) are ignored, since
+    // ABI head offsets are absolute.
+    match payload[0] {
+        // v29 - v33.
+        ENCODING_VERSION_INTEROP => {
+            let decoded = ExecutePayload::abi_decode_sequence(&payload[1..])
+                .expect("execute payload (encoding version 1) must decode");
+            let proof = &decoded.priorityOpsData[0];
+            (to_h256(&proof.leftPath), to_h256(&proof.rightPath))
+        }
+        // v34+: `StoredBatchInfo` gained a trailing `airbenderCommitment`.
+        ENCODING_VERSION_V34 => {
+            let decoded = ExecutePayloadV34::abi_decode_sequence(&payload[1..])
+                .expect("execute payload (encoding version 5) must decode");
+            let proof = &decoded.priorityOpsData[0];
+            (to_h256(&proof.leftPath), to_h256(&proof.rightPath))
+        }
+        other => panic!(
+            "Unsupported execute payload encoding version {other}; en-2fa supports {ENCODING_VERSION_INTEROP} (v29-v33) and {ENCODING_VERSION_V34} (v34+)"
+        ),
+    }
 }
